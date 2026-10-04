@@ -1,0 +1,126 @@
+name: TongXing Chopin KSU 3.3.0
+
+on:
+  push:
+    branches:
+      - chatgpt/tongxing-chopin-ksu330-build
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-14 lld-14 llvm-14 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            bc bison flex libssl-dev libelf-dev dwarves \
+            cpio rsync python3 git zip xz-utils
+
+      - name: Clone Xiaomi chopin 4.14.186 kernel
+        run: |
+          git clone --depth=1 --branch main \
+            https://github.com/qssn70/android_kernel_xiaomi_mt6893.git kernel
+          cd kernel
+          head -n 8 Makefile
+          test "$(awk '/^VERSION =/{v=$3}/^PATCHLEVEL =/{p=$3}/^SUBLEVEL =/{s=$3} END{print v"."p"."s}' Makefile)" = "4.14.186"
+
+      - name: Integrate official KernelSU v3.3.0
+        run: |
+          cd kernel
+          git clone --depth=1 --branch v3.3.0 https://github.com/tiann/KernelSU.git KernelSU
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q 'CONFIG_KSU.*kernelsu' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('arch/arm64/configs/chopin_defconfig')
+          s = p.read_text()
+          s = s.replace('CONFIG_LOCALVERSION=""', 'CONFIG_LOCALVERSION="-TongXing"')
+          s = s.replace('CONFIG_LOCALVERSION_AUTO=y', '# CONFIG_LOCALVERSION_AUTO is not set')
+          lines = [x for x in s.splitlines() if not x.startswith('CONFIG_KSU=') and x.strip() != '# CONFIG_KSU is not set']
+          lines += [
+              'CONFIG_KSU=y',
+              '# CONFIG_KSU_DEBUG is not set',
+          ]
+          p.write_text('\n'.join(lines) + '\n')
+          PY
+          grep -E 'CONFIG_LOCALVERSION|CONFIG_KSU' arch/arm64/configs/chopin_defconfig
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          make O=out \
+            CC=clang-14 HOSTCC=clang-14 HOSTCXX=clang++-14 \
+            LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14 \
+            OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14 \
+            chopin_defconfig
+          echo '--- effective config ---'
+          grep -E 'CONFIG_LOCALVERSION|CONFIG_KSU=' out/.config || true
+          echo '--- kernel release ---'
+          make -s O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CC=clang-14 HOSTCC=clang-14 HOSTCXX=clang++-14 \
+            LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14 \
+            OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14 \
+            kernelrelease
+
+      - name: Build Image.gz
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          make -j2 O=out \
+            CC=clang-14 HOSTCC=clang-14 HOSTCXX=clang++-14 \
+            LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14 \
+            OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14 \
+            Image.gz
+
+      - name: Verify and stage output
+        run: |
+          cd kernel
+          mkdir -p ../artifact
+          cp out/arch/arm64/boot/Image.gz ../artifact/Image.gz
+          cp out/arch/arm64/boot/Image ../artifact/Image
+          cp out/.config ../artifact/chopin_TongXing.config
+          cp out/System.map ../artifact/System.map || true
+          {
+            echo 'source=qssn70/android_kernel_xiaomi_mt6893@main'
+            echo 'kernelsu=tiann/KernelSU@v3.3.0'
+            echo -n 'kernelrelease='
+            make -s O=out ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              CLANG_TRIPLE=aarch64-linux-gnu- CC=clang-14 HOSTCC=clang-14 \
+              LD=ld.lld-14 AR=llvm-ar-14 NM=llvm-nm-14 \
+              OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 STRIP=llvm-strip-14 \
+              kernelrelease
+            echo 'expected=4.14.186-TongXing'
+            echo -n 'image_sha256='; sha256sum out/arch/arm64/boot/Image.gz | awk '{print $1}'
+            echo -n 'image_size='; stat -c%s out/arch/arm64/boot/Image.gz
+            echo -n 'ksu_config='; grep '^CONFIG_KSU=' out/.config || true
+          } | tee ../artifact/build-info.txt
+          strings out/arch/arm64/boot/Image | grep -m1 'Linux version' | tee ../artifact/linux-version.txt || true
+          strings out/arch/arm64/boot/Image | grep -m5 -E 'KernelSU|/data/adb/ksu|ksud' | tee ../artifact/ksu-strings.txt || true
+          cd ../artifact
+          zip -9 TongXing-chopin-4.14.186-KSU330-kernel.zip Image.gz Image chopin_TongXing.config System.map build-info.txt linux-version.txt ksu-strings.txt 2>/dev/null || \
+          zip -9 TongXing-chopin-4.14.186-KSU330-kernel.zip Image.gz Image chopin_TongXing.config build-info.txt linux-version.txt ksu-strings.txt
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TongXing-chopin-4.14.186-KSU330
+          path: artifact/TongXing-chopin-4.14.186-KSU330-kernel.zip
+          if-no-files-found: error
+          retention-days: 7
